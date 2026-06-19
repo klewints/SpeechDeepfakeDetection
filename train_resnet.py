@@ -1,11 +1,8 @@
 """
-Wav2Vec2 training script with enhanced features.
+ResNet18 training script for speech deepfake detection.
 
-Features:
-- Partial unfreezing of transformer layers
-- Discriminative learning rates
-- Longer training with early stopping
-- Gradient clipping and regularization
+Uses Mel spectrograms with enhanced telephony simulation.
+Implements learning rate scheduling, best model saving, and F1-based validation.
 """
 
 import torch
@@ -14,41 +11,25 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.data import WeightedRandomSampler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, accuracy_score
 import os
-from transformers import Wav2Vec2Processor
-from src.wav2vec_dataset import AudioRawDataset
-from src.wav2vec_model import Wav2Vec2DeepfakeModel
-
-
-def pad_collate_fn(batch):
-    """
-    Custom collate function to handle variable-length sequences.
-    
-    Pads sequences to the maximum length in the batch.
-    """
-    waveforms, labels = zip(*batch)
-    
-    # Get max length
-    max_len = max(w.shape[-1] for w in waveforms)
-    
-    # Pad waveforms
-    padded_waveforms = []
-    for w in waveforms:
-        if w.shape[-1] < max_len:
-            pad_len = max_len - w.shape[-1]
-            w = torch.nn.functional.pad(w, (0, pad_len))
-        padded_waveforms.append(w.squeeze(0))
-    
-    waveforms = torch.stack(padded_waveforms)
-    labels = torch.stack(labels)
-    
-    return waveforms, labels
+from src.dataset_loader import AudioDataset
+from src.resnet_model import ResNet18MelModel
 
 
 def train_epoch(model, train_loader, criterion, optimizer, device):
     """
     Train for one epoch.
+    
+    Args:
+        model: Neural network model
+        train_loader: Training data loader
+        criterion: Loss function
+        optimizer: Optimizer
+        device: torch.device
+    
+    Returns:
+        Average training loss, accuracy, F1 score
     """
     model.train()
     
@@ -58,16 +39,16 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
     all_preds = []
     all_labels = []
     
-    for input_values, labels in train_loader:
-        input_values = input_values.to(device)
-        labels = labels.to(device)
+    for x, y in train_loader:
+        x = x.to(device)
+        y = y.to(device)
         
         # Forward pass
         optimizer.zero_grad()
-        logits = model(input_values)
-        loss = criterion(logits, labels)
+        outputs = model(x)
+        loss = criterion(outputs, y)
         
-        # Backward pass with gradient clipping
+        # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -75,12 +56,12 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
         # Track metrics
         train_loss += loss.item()
         
-        _, predicted = torch.max(logits, 1)
-        train_correct += (predicted == labels).sum().item()
-        train_total += labels.size(0)
+        _, predicted = torch.max(outputs, 1)
+        train_correct += (predicted == y).sum().item()
+        train_total += y.size(0)
         
         all_preds.extend(predicted.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
+        all_labels.extend(y.cpu().numpy())
     
     train_acc = 100 * train_correct / train_total
     train_f1 = f1_score(all_labels, all_preds, average='weighted')
@@ -92,6 +73,15 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
 def validate_epoch(model, val_loader, criterion, device):
     """
     Validation for one epoch.
+    
+    Args:
+        model: Neural network model
+        val_loader: Validation data loader
+        criterion: Loss function
+        device: torch.device
+    
+    Returns:
+        Average validation loss, accuracy, F1 score
     """
     model.eval()
     
@@ -102,21 +92,21 @@ def validate_epoch(model, val_loader, criterion, device):
     all_labels = []
     
     with torch.no_grad():
-        for input_values, labels in val_loader:
-            input_values = input_values.to(device)
-            labels = labels.to(device)
+        for x, y in val_loader:
+            x = x.to(device)
+            y = y.to(device)
             
-            logits = model(input_values)
-            loss = criterion(logits, labels)
+            outputs = model(x)
+            loss = criterion(outputs, y)
             
             val_loss += loss.item()
             
-            _, predicted = torch.max(logits, 1)
-            val_correct += (predicted == labels).sum().item()
-            val_total += labels.size(0)
+            _, predicted = torch.max(outputs, 1)
+            val_correct += (predicted == y).sum().item()
+            val_total += y.size(0)
             
             all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
     
     val_acc = 100 * val_correct / val_total
     val_f1 = f1_score(all_labels, all_preds, average='weighted')
@@ -130,18 +120,18 @@ def validate_epoch(model, val_loader, criterion, device):
 # =========================
 
 print("=" * 60)
-print("Wav2Vec2 Training for Speech Deepfake Detection")
+print("ResNet18 Training for Speech Deepfake Detection")
 print("=" * 60)
 
 # Create output directory
-os.makedirs("outputs/wav2vec2", exist_ok=True)
+os.makedirs("outputs/resnet", exist_ok=True)
 
 # =========================
 # LOAD DATASET
 # =========================
 
-print("\nLoading dataset (raw audio)...")
-dataset = AudioRawDataset("dataset/metadata.csv", target_sr=16000)
+print("\nLoading dataset...")
+dataset = AudioDataset("dataset/metadata.csv")
 labels = dataset.df["label"].values
 
 print(f"Total samples: {len(dataset)}")
@@ -159,7 +149,7 @@ train_dataset, val_dataset = random_split(
 )
 
 # =========================
-# CLASS BALANCING
+# CLASS BALANCING WITH WEIGHTED SAMPLING
 # =========================
 
 train_indices = train_dataset.indices
@@ -188,16 +178,14 @@ sampler = WeightedRandomSampler(
 
 train_loader = DataLoader(
     train_dataset,
-    batch_size=8,  # Smaller batch for GPU memory
-    sampler=sampler,
-    collate_fn=pad_collate_fn
+    batch_size=16,
+    sampler=sampler
 )
 
 val_loader = DataLoader(
     val_dataset,
-    batch_size=8,
-    shuffle=False,
-    collate_fn=pad_collate_fn
+    batch_size=16,
+    shuffle=False
 )
 
 # =========================
@@ -205,23 +193,14 @@ val_loader = DataLoader(
 # =========================
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
+print(f"\nUsing device: {device}")
 
 # =========================
 # MODEL
 # =========================
 
-print("Loading Wav2Vec2 model...")
-model = Wav2Vec2DeepfakeModel(
-    unfreeze_layers=4,  # Unfreeze last 4 transformer layers
-    dropout_rate=0.3,
-    num_classes=2
-).to(device)
-
-# Print trainable parameters
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
+print("Loading pretrained ResNet18...")
+model = ResNet18MelModel(pretrained=True, dropout_rate=0.5).to(device)
 
 # =========================
 # LOSS FUNCTION
@@ -230,22 +209,21 @@ print(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
 criterion = nn.CrossEntropyLoss()
 
 # =========================
-# OPTIMIZER - DISCRIMINATIVE LEARNING RATES
+# OPTIMIZER - LOWER LR FOR PRETRAINED BACKBONE
 # =========================
 
-# Collect parameters by layer
-encoder_params = []
+# Use discriminative learning rates
+backbone_params = []
 head_params = []
 
 for name, param in model.named_parameters():
-    if param.requires_grad:
-        if 'classifier' in name:
-            head_params.append(param)
-        else:
-            encoder_params.append(param)
+    if 'resnet.fc' in name:
+        head_params.append(param)
+    else:
+        backbone_params.append(param)
 
 optimizer = torch.optim.AdamW([
-    {'params': encoder_params, 'lr': 1e-5},
+    {'params': backbone_params, 'lr': 1e-5},
     {'params': head_params, 'lr': 1e-4}
 ], weight_decay=1e-4)
 
@@ -257,18 +235,16 @@ scheduler = ReduceLROnPlateau(
     optimizer,
     mode='max',
     factor=0.5,
-    patience=2
+    patience=3
 )
 
 # =========================
 # TRAINING LOOP
 # =========================
 
-epochs = 15
+epochs = 20
 best_val_f1 = 0
-best_model_path = "outputs/wav2vec2/best_model.pth"
-early_stopping_patience = 5
-patience_counter = 0
+best_model_path = "outputs/resnet/best_model.pth"
 
 print("\n" + "=" * 60)
 print("Starting training...")
@@ -291,20 +267,14 @@ for epoch in range(epochs):
     # Learning rate scheduling
     scheduler.step(val_f1)
     
-    # Save best model
+    # Save best model based on F1
     if val_f1 > best_val_f1:
         best_val_f1 = val_f1
-        patience_counter = 0
         torch.save(model.state_dict(), best_model_path)
         print(f"  ✓ Best model saved (F1: {val_f1:.4f})")
-    else:
-        patience_counter += 1
-        if patience_counter >= early_stopping_patience:
-            print(f"\n⚠ Early stopping triggered after {epoch+1} epochs")
-            break
 
 # =========================
-# FINAL RESULTS
+# FINAL MODEL SAVE
 # =========================
 
 print("\n" + "=" * 60)

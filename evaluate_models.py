@@ -1,385 +1,574 @@
+
 import torch
-from torch.utils.data import DataLoader
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, roc_curve, confusion_matrix, ConfusionMatrixDisplay
-)
-import matplotlib.pyplot as plt
-import os
-import warnings
 
-warnings.filterwarnings("ignore")
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    roc_curve,
+    confusion_matrix
+)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
 
 from src.dataset_loader import AudioDataset
-from src.wav2vec_dataset import Wav2Vec2Dataset
 from src.model import CNNModel
-from src.wav2vec_model import Wav2Vec2Classifier
+from src.resnet_model import ResNet18MelModel
+from src.wav2vec_dataset import AudioRawDataset
+from src.wav2vec_model import Wav2Vec2DeepfakeModel
 
 
-# =========================
-# UTILITY FUNCTIONS
-# =========================
+# =====================================================
+# EER + THRESHOLD FUNCTIONS
+# =====================================================
 
-def compute_eer(y_true, y_scores):
+def compute_eer(fpr, fnr):
     """
     Compute Equal Error Rate (EER).
-    
-    EER is the point where FAR (False Alarm Rate) = FRR (False Rejection Rate).
-    
-    Args:
-        y_true: Ground truth binary labels
-        y_scores: Confidence scores (probabilities) for positive class
-    
-    Returns:
-        eer: Equal Error Rate value
-        threshold: EER threshold
-        far_list: False Alarm Rates
-        frr_list: False Rejection Rates
     """
-    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
-    
-    # FRR = 1 - TPR
-    frr = 1 - tpr
-    far = fpr
-    
-    # Find the threshold where FAR ≈ FRR
-    diff = np.abs(far - frr)
-    eer_idx = np.argmin(diff)
-    
-    eer = (far[eer_idx] + frr[eer_idx]) / 2
-    eer_threshold = thresholds[eer_idx]
-    
-    return eer, eer_threshold, far, frr, fpr, tpr, thresholds
+
+    abs_diffs = np.abs(fpr - fnr)
+
+    min_idx = np.argmin(abs_diffs)
+
+    eer = (fpr[min_idx] + fnr[min_idx]) / 2
+
+    return eer, min_idx
 
 
-def evaluate_model(model, dataloader, device, model_type="CNN"):
+def find_best_threshold(y_true, y_probs):
     """
-    Evaluate model and collect predictions and scores.
-    
-    Args:
-        model: PyTorch model
-        dataloader: DataLoader for evaluation
-        device: torch device
-        model_type: "CNN" or "Wav2Vec2" (for logging)
-    
-    Returns:
-        Dictionary with predictions, targets, and scores
+    Find threshold corresponding to EER point.
     """
+
+    fpr, tpr, thresholds = roc_curve(
+        y_true,
+        y_probs
+    )
+
+    fnr = 1 - tpr
+
+    abs_diffs = np.abs(fpr - fnr)
+
+    min_idx = np.argmin(abs_diffs)
+
+    best_threshold = thresholds[min_idx]
+
+    eer = (fpr[min_idx] + fnr[min_idx]) / 2
+
+    return (
+        best_threshold,
+        eer,
+        fpr[min_idx],
+        fnr[min_idx],
+        fpr,
+        tpr
+    )
+
+
+# =====================================================
+# MODEL EVALUATION
+# =====================================================
+
+def evaluate_model(
+    model,
+    test_loader,
+    device,
+    model_name,
+    is_wav2vec=False
+):
+
+    print(f"\nEvaluating {model_name}...")
+
     model.eval()
-    
-    all_preds = []
-    all_targets = []
-    all_scores = []  # Confidence scores for positive class
-    
+
+    all_probs = []
+    all_labels = []
+
     with torch.no_grad():
-        for batch_idx, (x, y) in enumerate(dataloader):
+
+        for x, y in test_loader:
+
             x = x.to(device)
             y = y.to(device)
-            
+
             outputs = model(x)
-            
-            # Get predictions
-            _, predicted = torch.max(outputs, 1)
-            
-            # Get scores (softmax probabilities for positive class)
-            probs = torch.nn.functional.softmax(outputs, dim=1)
-            scores = probs[:, 1].cpu().numpy()  # Probability of fake class
-            
-            all_preds.extend(predicted.cpu().numpy())
-            all_targets.extend(y.cpu().numpy())
-            all_scores.extend(scores)
-            
-            if (batch_idx + 1) % 10 == 0:
-                print(f"    [{model_type}] Batch {batch_idx+1}/{len(dataloader)}")
-    
-    return {
-        "predictions": np.array(all_preds),
-        "targets": np.array(all_targets),
-        "scores": np.array(all_scores)
-    }
 
+            probs = torch.softmax(
+                outputs,
+                dim=1
+            )
 
-def compute_metrics(y_true, y_pred, y_scores):
-    """
-    Compute all evaluation metrics.
-    
-    Args:
-        y_true: Ground truth labels
-        y_pred: Predicted labels
-        y_scores: Confidence scores
-    
-    Returns:
-        Dictionary with all metrics
-    """
+            fake_probs = probs[:, 1]
+
+            all_probs.extend(
+                fake_probs.cpu().numpy()
+            )
+
+            all_labels.extend(
+                y.cpu().numpy()
+            )
+
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+
+    # =====================================================
+    # FIND BEST THRESHOLD
+    # =====================================================
+
+    (
+        best_threshold,
+        eer,
+        far,
+        frr,
+        fpr,
+        tpr
+    ) = find_best_threshold(
+        all_labels,
+        all_probs
+    )
+
+    # =====================================================
+    # THRESHOLD-BASED PREDICTIONS
+    # =====================================================
+
+    all_preds = (
+        all_probs > best_threshold
+    ).astype(int)
+
+    # =====================================================
+    # METRICS
+    # =====================================================
+
+    accuracy = accuracy_score(
+        all_labels,
+        all_preds
+    )
+
+    precision = precision_score(
+        all_labels,
+        all_preds,
+        average='weighted'
+    )
+
+    recall = recall_score(
+        all_labels,
+        all_preds,
+        average='weighted'
+    )
+
+    f1 = f1_score(
+        all_labels,
+        all_preds,
+        average='weighted'
+    )
+
+    roc_auc = roc_auc_score(
+        all_labels,
+        all_probs
+    )
+
+    # =====================================================
+    # PRINT RESULTS
+    # =====================================================
+
+    print(f"Best Threshold: {best_threshold:.4f}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"ROC-AUC: {roc_auc:.4f}")
+    print(f"EER: {eer:.4f}")
+    print(f"FAR: {far:.4f}")
+    print(f"FRR: {frr:.4f}")
+
     metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "roc_auc": roc_auc_score(y_true, y_scores),
+        'model': model_name,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc_auc': roc_auc,
+        'eer': eer,
+        'far': far,
+        'frr': frr,
+        'threshold': best_threshold,
+        'predictions': all_preds,
+        'probabilities': all_probs,
+        'labels': all_labels,
+        'fpr': fpr,
+        'tpr': tpr
     }
-    
-    # Compute EER
-    eer, eer_threshold, far, frr, fpr, tpr, thresholds = compute_eer(y_true, y_scores)
-    metrics["eer"] = eer
-    metrics["eer_threshold"] = eer_threshold
-    metrics["far"] = far
-    metrics["frr"] = frr
-    metrics["fpr"] = fpr
-    metrics["tpr"] = tpr
-    metrics["thresholds"] = thresholds
-    
-    # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    metrics["confusion_matrix"] = cm
-    
+
     return metrics
 
 
-def plot_confusion_matrix(cm, model_name, save_path="outputs"):
-    """Plot and save confusion matrix."""
-    fig, ax = plt.subplots(figsize=(8, 6))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Real", "Fake"])
-    disp.plot(ax=ax, cmap="Blues")
-    plt.title(f"Confusion Matrix - {model_name}")
-    plt.ylabel("True Label")
-    plt.xlabel("Predicted Label")
+# =====================================================
+# ROC CURVES
+# =====================================================
+
+def plot_roc_curves(all_metrics, output_dir):
+
+    plt.figure(figsize=(10, 8))
+
+    for metrics in all_metrics:
+
+        plt.plot(
+            metrics['fpr'],
+            metrics['tpr'],
+            label=f"{metrics['model']} (AUC={metrics['roc_auc']:.4f})",
+            linewidth=2
+        )
+
+    plt.plot(
+        [0, 1],
+        [0, 1],
+        'k--',
+        label='Random'
+    )
+
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+
+    plt.title('ROC Curves')
+
+    plt.legend()
+
+    plt.grid(True)
+
+    output_path = os.path.join(
+        output_dir,
+        'roc_curves.png'
+    )
+
+    plt.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches='tight'
+    )
+
+    plt.close()
+
+    print(f"\n✓ ROC curves saved: {output_path}")
+
+
+# =====================================================
+# CONFUSION MATRICES
+# =====================================================
+
+def plot_confusion_matrices(all_metrics, output_dir):
+
+    fig, axes = plt.subplots(
+        1,
+        len(all_metrics),
+        figsize=(5 * len(all_metrics), 4)
+    )
+
+    if len(all_metrics) == 1:
+        axes = [axes]
+
+    for idx, metrics in enumerate(all_metrics):
+
+        cm = confusion_matrix(
+            metrics['labels'],
+            metrics['predictions']
+        )
+
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt='d',
+            cmap='Blues',
+            ax=axes[idx],
+            cbar=False
+        )
+
+        axes[idx].set_title(
+            metrics['model']
+        )
+
+        axes[idx].set_xlabel('Predicted')
+        axes[idx].set_ylabel('True')
+
+        axes[idx].set_xticklabels(
+            ['Real', 'Fake']
+        )
+
+        axes[idx].set_yticklabels(
+            ['Real', 'Fake']
+        )
+
     plt.tight_layout()
-    
-    filename = os.path.join(save_path, f"confusion_matrix_{model_name.replace(' ', '_')}.png")
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    print(f"    Saved: {filename}")
+
+    output_path = os.path.join(
+        output_dir,
+        'confusion_matrices.png'
+    )
+
+    plt.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches='tight'
+    )
+
     plt.close()
 
+    print(f"✓ Confusion matrices saved: {output_path}")
 
-def plot_roc_curves(results_cnn, results_wav2vec, save_path="outputs"):
-    """Plot and save ROC curves for both models."""
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    # CNN ROC curve
-    ax.plot(
-        results_cnn["metrics"]["fpr"],
-        results_cnn["metrics"]["tpr"],
-        label=f"CNN + Mel (AUC = {results_cnn['metrics']['roc_auc']:.3f})",
-        linewidth=2,
-        color="blue"
+
+# =====================================================
+# COMPARISON TABLE
+# =====================================================
+
+def create_comparison_table(
+    all_metrics,
+    output_dir
+):
+
+    data = []
+
+    for metrics in all_metrics:
+
+        data.append({
+            'Model': metrics['model'],
+            'Accuracy': f"{metrics['accuracy']:.4f}",
+            'Precision': f"{metrics['precision']:.4f}",
+            'Recall': f"{metrics['recall']:.4f}",
+            'F1': f"{metrics['f1']:.4f}",
+            'ROC-AUC': f"{metrics['roc_auc']:.4f}",
+            'EER': f"{metrics['eer']:.4f}",
+            'FAR': f"{metrics['far']:.4f}",
+            'FRR': f"{metrics['frr']:.4f}",
+            'Threshold': f"{metrics['threshold']:.4f}"
+        })
+
+    df = pd.DataFrame(data)
+
+    csv_path = os.path.join(
+        output_dir,
+        'comparison_metrics.csv'
     )
-    
-    # Wav2Vec2 ROC curve
-    ax.plot(
-        results_wav2vec["metrics"]["fpr"],
-        results_wav2vec["metrics"]["tpr"],
-        label=f"Wav2Vec2 (AUC = {results_wav2vec['metrics']['roc_auc']:.3f})",
-        linewidth=2,
-        color="orange"
-    )
-    
-    # Random classifier
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label="Random")
-    
-    ax.set_xlabel("False Positive Rate", fontsize=12)
-    ax.set_ylabel("True Positive Rate", fontsize=12)
-    ax.set_title("ROC Curves - Model Comparison", fontsize=14, fontweight='bold')
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    
-    filename = os.path.join(save_path, "roc_curves_comparison.png")
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    print(f"    Saved: {filename}")
-    plt.close()
+
+    df.to_csv(csv_path, index=False)
+
+    print(f"\n✓ Metrics saved: {csv_path}")
+
+    print("\n" + "=" * 120)
+    print("FINAL MODEL COMPARISON")
+    print("=" * 120)
+
+    print(df.to_string(index=False))
+
+    print("=" * 120)
+
+    return df
 
 
-def print_comparison_table(results_cnn, results_wav2vec):
-    """Print a formatted comparison table."""
-    print("\n" + "="*80)
-    print(" "*20 + "MODEL COMPARISON - EVALUATION METRICS")
-    print("="*80)
-    
-    metrics_list = ["accuracy", "precision", "recall", "f1", "roc_auc", "eer"]
-    
-    print(f"\n{'Metric':<15} {'CNN + Mel':<25} {'Wav2Vec2':<25} {'Difference':<15}")
-    print("-"*80)
-    
-    for metric in metrics_list:
-        cnn_val = results_cnn["metrics"][metric]
-        wav2vec_val = results_wav2vec["metrics"][metric]
-        diff = wav2vec_val - cnn_val
-        
-        # Format percentage
-        if metric in ["roc_auc", "eer"]:
-            print(f"{metric:<15} {cnn_val:<25.4f} {wav2vec_val:<25.4f} {diff:+.4f}")
-        else:
-            cnn_pct = cnn_val * 100
-            wav2vec_pct = wav2vec_val * 100
-            diff_pct = diff * 100
-            print(f"{metric:<15} {cnn_pct:<24.2f}% {wav2vec_pct:<24.2f}% {diff_pct:+.2f}%")
-    
-    print("="*80)
-    
-    # Confusion matrices
-    print("\nCONFUSION MATRICES:")
-    print("-"*80)
-    
-    cm_cnn = results_cnn["metrics"]["confusion_matrix"]
-    cm_wav2vec = results_wav2vec["metrics"]["confusion_matrix"]
-    
-    print("\nCNN + Mel:")
-    print(f"  True Negatives (Real):   {cm_cnn[0, 0]}")
-    print(f"  False Positives (Fake):  {cm_cnn[0, 1]}")
-    print(f"  False Negatives (Real):  {cm_cnn[1, 0]}")
-    print(f"  True Positives (Fake):   {cm_cnn[1, 1]}")
-    
-    print("\nWav2Vec2:")
-    print(f"  True Negatives (Real):   {cm_wav2vec[0, 0]}")
-    print(f"  False Positives (Fake):  {cm_wav2vec[0, 1]}")
-    print(f"  False Negatives (Real):  {cm_wav2vec[1, 0]}")
-    print(f"  True Positives (Fake):   {cm_wav2vec[1, 1]}")
-    
-    print("="*80)
+# =====================================================
+# MAIN
+# =====================================================
 
+print("=" * 60)
+print("Advanced Model Evaluation")
+print("=" * 60)
 
-# =========================
-# SETUP
-# =========================
-os.makedirs("outputs", exist_ok=True)
+os.makedirs("outputs/plots", exist_ok=True)
+os.makedirs("outputs/metrics", exist_ok=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}\n")
 
-# =========================
-# LOAD TEST DATA
-# =========================
-print("Loading test datasets...")
+print(f"Using device: {device}")
 
-# CNN uses Mel Spectrograms
-dataset_cnn = AudioDataset("dataset/metadata.csv")
-test_loader_cnn = DataLoader(dataset_cnn, batch_size=16, shuffle=False)
+# =====================================================
+# LOAD DATASETS
+# =====================================================
 
-# Wav2Vec2 uses raw waveforms
-dataset_wav2vec = Wav2Vec2Dataset("dataset/metadata.csv")
-test_loader_wav2vec = DataLoader(dataset_wav2vec, batch_size=8, shuffle=False)
+print("\nLoading datasets...")
 
-print(f"Total test samples: {len(dataset_cnn)}\n")
+dataset = AudioDataset("dataset/metadata.csv")
 
-# =========================
-# LOAD CNN MODEL
-# =========================
-print("Loading CNN model...")
-cnn_model = CNNModel().to(device)
-if os.path.exists("outputs/model.pth"):
-    cnn_model.load_state_dict(torch.load("outputs/model.pth", map_location=device))
-    print("✓ CNN model loaded from outputs/model.pth")
-else:
-    print("⚠ CNN model not found. Make sure to run train.py first.")
-    print("  Looking for: outputs/model.pth")
+train_size = int(0.8 * len(dataset))
 
-# =========================
-# LOAD WAV2VEC2 MODEL
-# =========================
-print("\nLoading Wav2Vec2 model...")
-wav2vec_model = Wav2Vec2Classifier().to(device)
-if os.path.exists("outputs/wav2vec2_model_best.pth"):
-    wav2vec_model.load_state_dict(
-        torch.load("outputs/wav2vec2_model_best.pth", map_location=device)
-    )
-    print("✓ Wav2Vec2 model loaded from outputs/wav2vec2_model_best.pth")
-elif os.path.exists("outputs/wav2vec2_model_final.pth"):
-    wav2vec_model.load_state_dict(
-        torch.load("outputs/wav2vec2_model_final.pth", map_location=device)
-    )
-    print("✓ Wav2Vec2 model loaded from outputs/wav2vec2_model_final.pth")
-else:
-    print("⚠ Wav2Vec2 model not found. Make sure to run train_wav2vec.py first.")
-    print("  Looking for: outputs/wav2vec2_model_best.pth or outputs/wav2vec2_model_final.pth")
-
-# =========================
-# EVALUATE CNN MODEL
-# =========================
-print("\n" + "="*60)
-print("EVALUATING CNN MODEL (Mel Spectrogram)")
-print("="*60)
-
-results_cnn = evaluate_model(cnn_model, test_loader_cnn, device, "CNN")
-results_cnn["metrics"] = compute_metrics(
-    results_cnn["targets"],
-    results_cnn["predictions"],
-    results_cnn["scores"]
+_, test_dataset = random_split(
+    dataset,
+    [train_size, len(dataset) - train_size]
 )
 
-print("✓ CNN evaluation complete")
-
-# =========================
-# EVALUATE WAV2VEC2 MODEL
-# =========================
-print("\n" + "="*60)
-print("EVALUATING WAV2VEC2 MODEL")
-print("="*60)
-
-results_wav2vec = evaluate_model(wav2vec_model, test_loader_wav2vec, device, "Wav2Vec2")
-results_wav2vec["metrics"] = compute_metrics(
-    results_wav2vec["targets"],
-    results_wav2vec["predictions"],
-    results_wav2vec["scores"]
+test_loader_mel = DataLoader(
+    test_dataset,
+    batch_size=16,
+    shuffle=False
 )
 
-print("✓ Wav2Vec2 evaluation complete")
+dataset_wav2vec = AudioRawDataset(
+    "dataset/metadata.csv",
+    target_sr=16000
+)
 
-# =========================
-# GENERATE VISUALIZATIONS
-# =========================
-print("\n" + "="*60)
-print("GENERATING VISUALIZATIONS")
-print("="*60)
+_, test_dataset_wav2vec = random_split(
+    dataset_wav2vec,
+    [train_size, len(dataset_wav2vec) - train_size]
+)
 
-print("\nCreating confusion matrix plots...")
-plot_confusion_matrix(results_cnn["metrics"]["confusion_matrix"], "CNN_Mel")
-plot_confusion_matrix(results_wav2vec["metrics"]["confusion_matrix"], "Wav2Vec2")
 
-print("\nCreating ROC curve comparison...")
-plot_roc_curves(results_cnn, results_wav2vec)
+def pad_collate_fn(batch):
 
-# =========================
-# PRINT RESULTS
-# =========================
-print_comparison_table(results_cnn, results_wav2vec)
+    waveforms, labels = zip(*batch)
 
-# =========================
-# SAVE RESULTS TO CSV
-# =========================
-print("\nSaving detailed results to CSV...")
+    max_len = max(
+        w.shape[-1]
+        for w in waveforms
+    )
 
-results_df = pd.DataFrame({
-    "Metric": ["Accuracy", "Precision", "Recall", "F1 Score", "ROC-AUC", "EER"],
-    "CNN + Mel": [
-        f"{results_cnn['metrics']['accuracy']*100:.2f}%",
-        f"{results_cnn['metrics']['precision']*100:.2f}%",
-        f"{results_cnn['metrics']['recall']*100:.2f}%",
-        f"{results_cnn['metrics']['f1']*100:.2f}%",
-        f"{results_cnn['metrics']['roc_auc']:.4f}",
-        f"{results_cnn['metrics']['eer']:.4f}",
-    ],
-    "Wav2Vec2": [
-        f"{results_wav2vec['metrics']['accuracy']*100:.2f}%",
-        f"{results_wav2vec['metrics']['precision']*100:.2f}%",
-        f"{results_wav2vec['metrics']['recall']*100:.2f}%",
-        f"{results_wav2vec['metrics']['f1']*100:.2f}%",
-        f"{results_wav2vec['metrics']['roc_auc']:.4f}",
-        f"{results_wav2vec['metrics']['eer']:.4f}",
-    ]
-})
+    padded_waveforms = []
 
-csv_path = "outputs/evaluation_results.csv"
-results_df.to_csv(csv_path, index=False)
-print(f"✓ Results saved to {csv_path}")
+    for w in waveforms:
 
-print("\n" + "="*80)
-print("EVALUATION COMPLETE!")
-print("="*80)
-print("\nGenerated files:")
-print("  - outputs/confusion_matrix_CNN_Mel.png")
-print("  - outputs/confusion_matrix_Wav2Vec2.png")
-print("  - outputs/roc_curves_comparison.png")
-print("  - outputs/evaluation_results.csv")
-print("="*80)
+        if w.shape[-1] < max_len:
+
+            pad_len = max_len - w.shape[-1]
+
+            w = torch.nn.functional.pad(
+                w,
+                (0, pad_len)
+            )
+
+        padded_waveforms.append(
+            w.squeeze(0)
+        )
+
+    waveforms = torch.stack(
+        padded_waveforms
+    )
+
+    labels = torch.stack(labels)
+
+    return waveforms, labels
+
+
+test_loader_wav2vec = DataLoader(
+    test_dataset_wav2vec,
+    batch_size=8,
+    shuffle=False,
+    collate_fn=pad_collate_fn
+)
+
+# =====================================================
+# LOAD MODELS
+# =====================================================
+
+print("\nLoading models...")
+
+all_metrics = []
+
+# CNN
+cnn_path = "outputs/model.pth"
+
+if os.path.exists(cnn_path):
+
+    cnn_model = CNNModel().to(device)
+
+    cnn_model.load_state_dict(
+        torch.load(
+            cnn_path,
+            map_location=device
+        )
+    )
+
+    print("✓ CNN model loaded")
+
+    cnn_metrics = evaluate_model(
+        cnn_model,
+        test_loader_mel,
+        device,
+        "CNN + Mel Spectrogram"
+    )
+
+    all_metrics.append(cnn_metrics)
+
+# RESNET
+resnet_path = "outputs/resnet/best_model.pth"
+
+if os.path.exists(resnet_path):
+
+    resnet_model = ResNet18MelModel().to(device)
+
+    resnet_model.load_state_dict(
+        torch.load(
+            resnet_path,
+            map_location=device
+        )
+    )
+
+    print("✓ ResNet18 model loaded")
+
+    resnet_metrics = evaluate_model(
+        resnet_model,
+        test_loader_mel,
+        device,
+        "ResNet18 + Mel Spectrogram"
+    )
+
+    all_metrics.append(resnet_metrics)
+
+# WAV2VEC2
+wav2vec_path = "outputs/wav2vec2/best_model.pth"
+
+if os.path.exists(wav2vec_path):
+
+    wav2vec_model = Wav2Vec2DeepfakeModel().to(device)
+
+    wav2vec_model.load_state_dict(
+        torch.load(
+            wav2vec_path,
+            map_location=device
+        )
+    )
+
+    print("✓ Wav2Vec2 model loaded")
+
+    wav2vec_metrics = evaluate_model(
+        wav2vec_model,
+        test_loader_wav2vec,
+        device,
+        "Wav2Vec2",
+        is_wav2vec=True
+    )
+
+    all_metrics.append(wav2vec_metrics)
+
+# =====================================================
+# FINAL OUTPUTS
+# =====================================================
+
+if all_metrics:
+
+    create_comparison_table(
+        all_metrics,
+        "outputs/metrics"
+    )
+
+    plot_roc_curves(
+        all_metrics,
+        "outputs/plots"
+    )
+
+    plot_confusion_matrices(
+        all_metrics,
+        "outputs/plots"
+    )
+
+    print("\nEvaluation complete!")
+
+else:
+
+    print("\nNo trained models found.")
