@@ -4,35 +4,7 @@ import random
 from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
-def apply_telephony_effects(y):
-
-    # =========================
-    # RANDOM VOLUME CHANGE
-    # =========================
-
-    volume_scale = random.uniform(0.7, 1.0)
-
-    y = y * volume_scale
-
-    # =========================
-    # ADD BACKGROUND NOISE
-    # =========================
-
-    noise = np.random.normal(
-        0,
-        0.005,
-        len(y)
-    )
-
-    y = y + noise
-
-    # =========================
-    # CLIP VALUES
-    # =========================
-
-    y = np.clip(y, -1.0, 1.0)
-
-    return y
+from .telephony_effects import apply_telephony_effects
 class AudioDataset(Dataset):
 
     def __init__(self, csv_file):
