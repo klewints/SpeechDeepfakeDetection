@@ -471,7 +471,7 @@ print("\nLoading models...")
 all_metrics = []
 
 # CNN
-cnn_path = "outputs/model.pth"
+cnn_path = "outputs/best_cnn_model.pth"
 
 if os.path.exists(cnn_path):
 

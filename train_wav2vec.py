@@ -264,7 +264,7 @@ scheduler = ReduceLROnPlateau(
 # TRAINING LOOP
 # =========================
 
-epochs = 15
+epochs = 10
 best_val_f1 = 0
 best_model_path = "outputs/wav2vec2/best_model.pth"
 early_stopping_patience = 5

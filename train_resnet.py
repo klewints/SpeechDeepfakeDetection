@@ -242,7 +242,7 @@ scheduler = ReduceLROnPlateau(
 # TRAINING LOOP
 # =========================
 
-epochs = 20
+epochs = 10
 best_val_f1 = 0
 best_model_path = "outputs/resnet/best_model.pth"
 

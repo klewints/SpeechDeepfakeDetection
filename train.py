@@ -1,9 +1,19 @@
+
+import os
 import torch
-from torch.utils.data import DataLoader, random_split
-from torch.utils.data import WeightedRandomSampler
 import numpy as np
+
+from torch.utils.data import (
+    DataLoader,
+    random_split,
+    WeightedRandomSampler
+)
+
+from sklearn.metrics import f1_score
+
 from src.dataset_loader import AudioDataset
 from src.model import CNNModel
+
 
 # =========================
 # LOAD DATASET
@@ -12,7 +22,6 @@ from src.model import CNNModel
 dataset = AudioDataset(
     "dataset/metadata.csv"
 )
-labels = dataset.df["label"].values
 
 print("Total samples:", len(dataset))
 
@@ -30,10 +39,7 @@ train_dataset, val_dataset = random_split(
 )
 
 # =========================
-# DATALOADERS
-# =========================
-# =========================
-# GET TRAIN LABELS ONLY
+# GET TRAIN LABELS
 # =========================
 
 train_indices = train_dataset.indices
@@ -49,7 +55,7 @@ train_labels = [
 
 class_counts = np.bincount(train_labels)
 
-class_weights = 1. / class_counts
+class_weights = 1.0 / class_counts
 
 sample_weights = [
     class_weights[label]
@@ -60,16 +66,23 @@ sampler = WeightedRandomSampler(
     sample_weights,
     len(sample_weights)
 )
+
+# =========================
+# DATALOADERS
+# =========================
+
 train_loader = DataLoader(
     train_dataset,
     batch_size=16,
     sampler=sampler
 )
+
 val_loader = DataLoader(
     val_dataset,
     batch_size=16,
     shuffle=False
 )
+
 # =========================
 # DEVICE
 # =========================
@@ -85,15 +98,31 @@ print("Using device:", device)
 model = CNNModel().to(device)
 
 # =========================
-# LOSS + OPTIMIZER
+# LOSS FUNCTION
 # =========================
 
 criterion = torch.nn.CrossEntropyLoss()
+
+# =========================
+# OPTIMIZER
+# =========================
 
 optimizer = torch.optim.Adam(
     model.parameters(),
     lr=1e-5
 )
+
+# =========================
+# OUTPUT DIRECTORY
+# =========================
+
+os.makedirs("outputs", exist_ok=True)
+
+# =========================
+# BEST MODEL TRACKING
+# =========================
+
+best_val_f1 = 0.0
 
 # =========================
 # TRAINING LOOP
@@ -109,7 +138,7 @@ for epoch in range(epochs):
 
     model.train()
 
-    train_loss = 0
+    train_loss = 0.0
 
     train_correct = 0
 
@@ -147,11 +176,15 @@ for epoch in range(epochs):
 
     model.eval()
 
+    val_loss = 0.0
+
     val_correct = 0
 
     val_total = 0
 
-    val_loss = 0
+    all_preds = []
+
+    all_labels = []
 
     with torch.no_grad():
 
@@ -173,7 +206,25 @@ for epoch in range(epochs):
 
             val_total += y.size(0)
 
+            all_preds.extend(
+                predicted.cpu().numpy()
+            )
+
+            all_labels.extend(
+                y.cpu().numpy()
+            )
+
     val_acc = 100 * val_correct / val_total
+
+    # ======================
+    # F1 SCORE
+    # ======================
+
+    val_f1 = f1_score(
+        all_labels,
+        all_preds,
+        average="weighted"
+    )
 
     # ======================
     # PRINT RESULTS
@@ -197,13 +248,43 @@ for epoch in range(epochs):
         f"Validation Accuracy: {val_acc:.2f}%"
     )
 
+    print(
+        f"Validation F1 Score: {val_f1:.4f}"
+    )
+
+    # ======================
+    # SAVE BEST MODEL
+    # ======================
+
+    if val_f1 > best_val_f1:
+
+        best_val_f1 = val_f1
+
+        torch.save(
+            model.state_dict(),
+            "outputs/best_cnn_model.pth"
+        )
+
+        print(
+            f"✓ Best CNN model saved! "
+            f"F1 Score: {val_f1:.4f}"
+        )
+
 # =========================
-# SAVE MODEL
+# SAVE FINAL MODEL
 # =========================
 
 torch.save(
     model.state_dict(),
-    "outputs/model.pth"
+    "outputs/final_cnn_model.pth"
 )
 
-print("Model saved.")
+print("\nTraining complete.")
+
+print(
+    f"Best Validation F1 Score: "
+    f"{best_val_f1:.4f}"
+)
+
+print("Final CNN model saved.")
+
