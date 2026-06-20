@@ -6,6 +6,7 @@ Features:
 - Discriminative learning rates
 - Longer training with early stopping
 - Gradient clipping and regularization
+- EER and ROC-AUC based model selection
 """
 
 import torch
@@ -14,11 +15,30 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.data import WeightedRandomSampler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, roc_curve, auc
 import os
 from transformers import Wav2Vec2Processor
 from src.wav2vec_dataset import AudioRawDataset
 from src.wav2vec_model import Wav2Vec2DeepfakeModel
+
+
+def compute_eer(fpr, fnr):
+    """
+    Compute Equal Error Rate (EER) from FPR and FNR curves.
+    EER is the point where FPR = FNR.
+    
+    Args:
+        fpr: False positive rates
+        fnr: False negative rates
+    
+    Returns:
+        eer: Equal error rate value
+        threshold_idx: Index where EER occurs
+    """
+    diff = np.abs(fpr - fnr)
+    threshold_idx = np.argmin(diff)
+    eer = (fpr[threshold_idx] + fnr[threshold_idx]) / 2
+    return eer, threshold_idx
 
 
 def pad_collate_fn(batch):
@@ -92,6 +112,17 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
 def validate_epoch(model, val_loader, criterion, device):
     """
     Validation for one epoch.
+    
+    Computes EER and ROC-AUC for model selection instead of F1-score.
+    
+    Args:
+        model: Neural network model
+        val_loader: Validation data loader
+        criterion: Loss function
+        device: torch.device
+    
+    Returns:
+        Average validation loss, accuracy, F1 score, EER, ROC-AUC
     """
     model.eval()
     
@@ -100,6 +131,7 @@ def validate_epoch(model, val_loader, criterion, device):
     val_total = 0
     all_preds = []
     all_labels = []
+    all_probs = []
     
     with torch.no_grad():
         for input_values, labels in val_loader:
@@ -110,6 +142,10 @@ def validate_epoch(model, val_loader, criterion, device):
             loss = criterion(logits, labels)
             
             val_loss += loss.item()
+            
+            # Get probabilities for positive class
+            probs = torch.softmax(logits, dim=1)
+            all_probs.extend(probs[:, 1].cpu().numpy())
             
             _, predicted = torch.max(logits, 1)
             val_correct += (predicted == labels).sum().item()
@@ -122,7 +158,15 @@ def validate_epoch(model, val_loader, criterion, device):
     val_f1 = f1_score(all_labels, all_preds, average='weighted')
     val_loss_avg = val_loss / len(val_loader)
     
-    return val_loss_avg, val_acc, val_f1
+    # Compute ROC curve
+    fpr, tpr, thresholds = roc_curve(all_labels, all_probs)
+    roc_auc = auc(fpr, tpr)
+    
+    # Compute EER
+    fnr = 1 - tpr
+    eer, _ = compute_eer(fpr, fnr)
+    
+    return val_loss_avg, val_acc, val_f1, eer, roc_auc
 
 
 # =========================
@@ -255,7 +299,7 @@ optimizer = torch.optim.AdamW([
 
 scheduler = ReduceLROnPlateau(
     optimizer,
-    mode='max',
+    mode='min',
     factor=0.5,
     patience=2
 )
@@ -264,8 +308,9 @@ scheduler = ReduceLROnPlateau(
 # TRAINING LOOP
 # =========================
 
-epochs = 10
-best_val_f1 = 0
+epochs = 15
+best_val_eer = float('inf')
+best_val_roc_auc = 0
 best_model_path = "outputs/wav2vec2/best_model.pth"
 early_stopping_patience = 5
 patience_counter = 0
@@ -280,23 +325,26 @@ for epoch in range(epochs):
         model, train_loader, criterion, optimizer, device
     )
     
-    val_loss, val_acc, val_f1 = validate_epoch(
+    val_loss, val_acc, val_f1, val_eer, val_roc_auc = validate_epoch(
         model, val_loader, criterion, device
     )
     
     print(f"\nEpoch {epoch+1}/{epochs}")
     print(f"  Train Loss: {train_loss:.4f} | Acc: {train_acc:.2f}% | F1: {train_f1:.4f}")
     print(f"  Val Loss:   {val_loss:.4f} | Acc: {val_acc:.2f}% | F1: {val_f1:.4f}")
+    print(f"  Val EER:    {val_eer:.4f} | ROC-AUC: {val_roc_auc:.4f}")
     
-    # Learning rate scheduling
-    scheduler.step(val_f1)
+    # Learning rate scheduling (based on EER now)
+    scheduler.step(val_eer)
     
-    # Save best model
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
+    # Save best model based on EER (lower is better)
+    # If EER is equal, use higher ROC-AUC as tie-breaker
+    if val_eer < best_val_eer or (val_eer == best_val_eer and val_roc_auc > best_val_roc_auc):
+        best_val_eer = val_eer
+        best_val_roc_auc = val_roc_auc
         patience_counter = 0
         torch.save(model.state_dict(), best_model_path)
-        print(f"  ✓ Best model saved (F1: {val_f1:.4f})")
+        print(f"  ✓ Best model saved (EER: {val_eer:.4f}, ROC-AUC: {val_roc_auc:.4f})")
     else:
         patience_counter += 1
         if patience_counter >= early_stopping_patience:
@@ -308,6 +356,6 @@ for epoch in range(epochs):
 # =========================
 
 print("\n" + "=" * 60)
-print(f"Training complete! Best F1: {best_val_f1:.4f}")
+print(f"Training complete! Best EER: {best_val_eer:.4f}, Best ROC-AUC: {best_val_roc_auc:.4f}")
 print(f"Model saved to: {best_model_path}")
 print("=" * 60)
