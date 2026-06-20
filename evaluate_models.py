@@ -1,7 +1,6 @@
-
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, random_split
 
 import numpy as np
 import pandas as pd
@@ -26,20 +25,6 @@ from src.resnet_model import ResNet18MelModel
 from src.wav2vec_dataset import AudioRawDataset
 from src.wav2vec_model import Wav2Vec2DeepfakeModel
 
-import random
-
-# -----------------------------
-# Reproducibility settings
-# -----------------------------
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-# Ensure deterministic behavior where possible
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 # =====================================================
 # EER + THRESHOLD FUNCTIONS
@@ -408,44 +393,29 @@ print(f"Using device: {device}")
 
 print("\nLoading datasets...")
 
-# Load datasets (both read the same metadata.csv so indices align)
 dataset = AudioDataset("dataset/metadata.csv")
+
+train_size = int(0.8 * len(dataset))
+
+_, test_dataset = random_split(
+    dataset,
+    [train_size, len(dataset) - train_size]
+)
+
+test_loader_mel = DataLoader(
+    test_dataset,
+    batch_size=16,
+    shuffle=False
+)
 
 dataset_wav2vec = AudioRawDataset(
     "dataset/metadata.csv",
     target_sr=16000
 )
 
-# Ensure both datasets have the same ordering/length
-assert len(dataset) == len(dataset_wav2vec), "Dataset lengths differ!"
-
-n = len(dataset)
-train_size = int(0.8 * n)
-indices_file = "outputs/test_split_indices.pt"
-
-# Use saved deterministic test indices if available, otherwise create and save them
-if os.path.exists(indices_file):
-    saved = torch.load(indices_file)
-    test_indices = saved['test_indices']
-    print(f"Loaded saved test indices ({len(test_indices)}) from {indices_file}")
-else:
-    gen = torch.Generator()
-    gen.manual_seed(SEED)
-    perm = torch.randperm(n, generator=gen).tolist()
-    train_indices = perm[:train_size]
-    test_indices = perm[train_size:]
-    torch.save({'train_indices': train_indices, 'test_indices': test_indices}, indices_file)
-    print(f"Saved test indices ({len(test_indices)}) to {indices_file}")
-
-# Create Subset views so both models evaluate on the exact same samples
-test_dataset = Subset(dataset, test_indices)
-test_dataset_wav2vec = Subset(dataset_wav2vec, test_indices)
-
-# DataLoaders for evaluation (no shuffling)
-test_loader_mel = DataLoader(
-    test_dataset,
-    batch_size=16,
-    shuffle=False
+_, test_dataset_wav2vec = random_split(
+    dataset_wav2vec,
+    [train_size, len(dataset_wav2vec) - train_size]
 )
 
 
@@ -500,7 +470,7 @@ print("\nLoading models...")
 all_metrics = []
 
 # CNN
-cnn_path = "outputs/best_cnn_model.pth"
+cnn_path = "outputs/model.pth"
 
 if os.path.exists(cnn_path):
 
