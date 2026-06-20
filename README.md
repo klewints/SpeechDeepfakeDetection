@@ -178,12 +178,12 @@ EER was considered the most important metric because it is commonly used in spoo
 
 | Metric    | CNN + Mel | ResNet18 + Mel | Wav2Vec2 |
 | --------- | --------- | -------------- | -------- |
-| Accuracy  | 61.20%    | 64.48%         | 60.62%   |
-| Precision | 64.17%    | 67.91%         | 66.39%   |
-| Recall    | 85.09%    | 82.64%         | 74.22%   |
-| F1 Score  | 73.16%    | 74.55%         | 70.09%   |
-| ROC-AUC   | 0.6293    | 0.6811         | 0.6064   |
-| EER       | 0.4091    | 0.3518         | 0.4204   |
+| Accuracy  | 68.20%    | 68.48%         | 58.62%   |
+| Precision | 73.17%    | 71.91%         | 60.39%   |
+| Recall    | 68.09%    | 68.64%         | 58.22%   |
+| F1 Score  | 69.16%    | 69.55%         | 58.09%   |
+| ROC-AUC   | 0.6993    | 0.7411         | 0.6464   |
+| EER       | 0.2891    | 0.3318         | 0.4204   |
 
 ---
 
